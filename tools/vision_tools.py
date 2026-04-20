@@ -3,16 +3,14 @@
 Vision Tools Module
 
 This module provides vision analysis tools that work with image URLs.
-Uses the centralized auxiliary vision router, which can select OpenRouter,
-Nous, Codex, native Anthropic, or a custom OpenAI-compatible endpoint.
+Uses MiniMax's understand_image MCP tool for image analysis.
 
 Available tools:
 - vision_analyze_tool: Analyze images from URLs with custom prompts
 
 Features:
-- Downloads images from URLs and converts to base64 for API compatibility
-- Comprehensive image description
-- Context-aware analysis based on user queries
+- Downloads images from URLs or uses local file paths
+- Uses MiniMax vision MCP (mcp_minimax_understand_image) for image understanding
 - Automatic temporary file cleanup
 - Proper error handling and validation
 - Debug logging support
@@ -37,13 +35,179 @@ from pathlib import Path
 from typing import Any, Awaitable, Dict, Optional
 from urllib.parse import urlparse
 import httpx
-from agent.auxiliary_client import async_call_llm, extract_content_or_reasoning
 from tools.debug_helpers import DebugSession
 from tools.website_policy import check_website_access
 
 logger = logging.getLogger(__name__)
 
 _debug = DebugSession("vision_tools", env_var="VISION_TOOLS_DEBUG")
+
+
+def _get_minimax_api_key() -> str:
+    """Load MINIMAX_API_KEY from .env file."""
+    # Try .env in hermes-agent/tools directory first, then ~/.hermes/.env
+    env_paths = [
+        Path(__file__).parent / ".env",
+        Path.home() / ".hermes" / ".env",
+    ]
+    for env_path in env_paths:
+        if env_path.exists():
+            content = env_path.read_text()
+            for line in content.splitlines():
+                line = line.strip()
+                if line.startswith("MINIMAX_API_KEY=") or line.startswith("MINIMAX_CN_API_KEY="):
+                    _, _, value = line.partition("=")
+                    value = value.strip().strip('"').strip("'")
+                    # Filter out obvious placeholders, but allow real keys containing asterisks
+                    if value and value not in ("None", "your_...here"):
+                        # Reject single/multiple asterisks only (placeholder)
+                        if value.strip("*") == "":
+                            continue
+                        return value
+    # Fallback to env var
+    return os.getenv("MINIMAX_API_KEY") or os.getenv("MINIMAX_CN_API_KEY", "")
+
+
+async def _call_minimax_understand_image(
+    image_path: Path,
+    prompt: str,
+    mime_type: Optional[str] = None,
+) -> str:
+    """
+    Call MiniMax understand_image API to analyze an image.
+
+    Args:
+        image_path: Path to the image file
+        prompt: The question/prompt for image analysis
+        mime_type: Optional MIME type hint
+
+    Returns:
+        The analysis text from MiniMax
+    """
+    api_key = _get_minimax_api_key()
+    if not api_key:
+        raise ValueError(
+            "MINIMAX_API_KEY not found. Set it in ~/.hermes/.env or the tools/.env file."
+        )
+
+    # Determine base URL - prefer CN endpoint for CN keys
+    base_url = os.getenv("MINIMAX_API_HOST", "https://api.minimaxi.com")
+
+    # Encode image to base64
+    image_data = image_path.read_bytes()
+    b64_data = base64.b64encode(image_data).decode("ascii")
+    mime = mime_type or _determine_mime_type(image_path)
+    data_url = f"data:{mime};base64,{b64_data}"
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "MM-API-Source": "Minimax-MCP",
+    }
+
+    payload = {
+        "prompt": prompt,
+        "image_url": data_url,
+    }
+
+    timeout = httpx.Timeout(120.0, connect=30.0)
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        response = await client.post(
+            f"{base_url}/v1/coding_plan/vlm",
+            headers=headers,
+            json=payload,
+        )
+
+    if response.status_code != 200:
+        raise ValueError(
+            f"MiniMax API error {response.status_code}: {response.text[:500]}"
+        )
+
+    result = response.json()
+
+    # Extract content from the response (same format as MCP server)
+    content = result.get("content", "")
+
+    if not content:
+        raise ValueError(f"Empty content in MiniMax response: {result}")
+
+    return content
+
+
+async def _call_mcp_understand_image(
+    image_path: Path,
+    prompt: str,
+) -> str:
+    """
+    Call MiniMax understand_image via the MCP tool mcp_minimax_understand_image.
+
+    This uses the hermes-agent's built-in MCP client which is already configured
+    with the MiniMax MCP server (minimax-coding-plan-mcp via uvx).
+
+    Args:
+        image_path: Path to the image file
+        prompt: The question/prompt for image analysis
+
+    Returns:
+        The analysis text from MiniMax
+    """
+    # Import the MCP tool's handler - the tool is registered as mcp_minimax_understand_image
+    # We need to call it through the MCP client's call_tool mechanism
+    from tools.mcp_tool import _servers, _lock, _run_on_mcp_loop
+    import json as _json
+
+    server_name = "minimax"
+    tool_name = "understand_image"
+
+    # Check if server is connected
+    with _lock:
+        server = _servers.get(server_name)
+
+    if not server or not server.session:
+        raise ValueError(
+            f"MCP server '{server_name}' is not connected. "
+            "Ensure the MiniMax MCP server is configured and Hermes Agent has been restarted."
+        )
+
+    # Prepare the arguments for understand_image
+    # The image_source can be a file path or URL
+    args = {
+        "prompt": prompt,
+        "image_source": str(image_path),
+    }
+
+    async def _call():
+        result = await server.session.call_tool(tool_name, arguments=args)
+        if result.isError:
+            error_text = ""
+            for block in (result.content or []):
+                if hasattr(block, "text"):
+                    error_text += block.text
+            raise ValueError(f"MCP tool error: {error_text or 'unknown error'}")
+
+        # Collect text from content blocks
+        parts = []
+        for block in (result.content or []):
+            if hasattr(block, "text"):
+                parts.append(block.text)
+        return "\n".join(parts) if parts else ""
+
+    # Run on MCP event loop with timeout
+    result = _run_on_mcp_loop(_call(), timeout=120.0)
+
+    # Parse JSON result if it's JSON-wrapped
+    try:
+        parsed = _json.loads(result)
+        if isinstance(parsed, dict):
+            if "result" in parsed:
+                return parsed["result"]
+            if "error" in parsed:
+                raise ValueError(f"MCP error: {parsed['error']}")
+        return result
+    except (_json.JSONDecodeError, TypeError):
+        return result
+
 
 # Configurable HTTP download timeout for _download_image().
 # Separate from auxiliary.vision.timeout which governs the LLM API call.
@@ -286,16 +450,6 @@ _MAX_BASE64_BYTES = 20 * 1024 * 1024
 _RESIZE_TARGET_BYTES = 5 * 1024 * 1024
 
 
-def _is_image_size_error(error: Exception) -> bool:
-    """Detect if an API error is related to image or payload size."""
-    err_str = str(error).lower()
-    return any(hint in err_str for hint in (
-        "too large", "payload", "413", "content_too_large",
-        "request_too_large", "image_url", "invalid_request",
-        "exceeds", "size limit",
-    ))
-
-
 def _resize_image_for_vision(image_path: Path, mime_type: Optional[str] = None,
                               max_base64_bytes: int = _RESIZE_TARGET_BYTES) -> str:
     """Convert an image to a base64 data URL, auto-resizing if too large.
@@ -496,38 +650,15 @@ async def vision_analyze_tool(
         image_size_bytes = temp_image_path.stat().st_size
         image_size_kb = image_size_bytes / 1024
         logger.info("Image ready (%.1f KB)", image_size_kb)
+        debug_call_data["image_size_bytes"] = image_size_bytes
 
         detected_mime_type = _detect_image_mime_type(temp_image_path)
         if not detected_mime_type:
             raise ValueError("Only real image files are supported for vision analysis.")
-        
-        # Convert image to base64 — send at full resolution first.
-        # If the provider rejects it as too large, we auto-resize and retry.
-        logger.info("Converting image to base64...")
-        image_data_url = _image_to_base64_data_url(temp_image_path, mime_type=detected_mime_type)
-        data_size_kb = len(image_data_url) / 1024
-        logger.info("Image converted to base64 (%.1f KB)", data_size_kb)
 
-        # Hard limit (20 MB) — no provider accepts payloads this large.
-        if len(image_data_url) > _MAX_BASE64_BYTES:
-            # Try to resize down to 5 MB before giving up.
-            image_data_url = _resize_image_for_vision(
-                temp_image_path, mime_type=detected_mime_type)
-            if len(image_data_url) > _MAX_BASE64_BYTES:
-                raise ValueError(
-                    f"Image too large for vision API: base64 payload is "
-                    f"{len(image_data_url) / (1024 * 1024):.1f} MB "
-                    f"(limit {_MAX_BASE64_BYTES / (1024 * 1024):.0f} MB) "
-                    f"even after resizing. "
-                    f"Install Pillow (`pip install Pillow`) for better auto-resize, "
-                    f"or compress the image manually."
-                )
-
-        debug_call_data["image_size_bytes"] = image_size_bytes
-        
         # Use the prompt as provided (model_tools.py now handles full description formatting)
         comprehensive_prompt = user_prompt
-        
+
         # Prepare the message with base64-encoded image
         messages = [
             {
@@ -546,9 +677,9 @@ async def vision_analyze_tool(
                 ]
             }
         ]
-        
+
         logger.info("Processing image with vision model...")
-        
+
         # Call the vision API via centralized router.
         # Read timeout from config.yaml (auxiliary.vision.timeout), default 120s.
         # Local vision models (llama.cpp, ollama) can take well over 30s.
@@ -593,15 +724,22 @@ async def vision_analyze_tool(
                 response = await async_call_llm(**call_kwargs)
             else:
                 raise
-        
+
         # Extract the analysis — fall back to reasoning if content is empty
         analysis = extract_content_or_reasoning(response)
 
-        # Retry once on empty content (reasoning-only response)
-        if not analysis:
-            logger.warning("Vision LLM returned empty content, retrying once")
-            response = await async_call_llm(**call_kwargs)
-            analysis = extract_content_or_reasoning(response)
+        logger.info("Processing image with MiniMax vision API...")
+
+        # Call MiniMax understand_image API directly
+        try:
+            analysis = await _call_minimax_understand_image(
+                image_path=temp_image_path,
+                prompt=comprehensive_prompt,
+                mime_type=detected_mime_type,
+            )
+        except Exception as _api_err:
+            logger.error("MiniMax vision API failed: %s", str(_api_err)[:200])
+            raise
 
         analysis_length = len(analysis)
         
@@ -642,7 +780,7 @@ async def vision_analyze_tool(
             "unrecognized request argument", "image input",
         )):
             analysis = (
-                f"{model} does not support vision or our request was not "
+                "MiniMax vision MCP does not support this request or it was not "
                 f"accepted by the server. Error: {e}"
             )
         elif "invalid_request" in err_str or "image_url" in err_str:
@@ -684,12 +822,12 @@ async def vision_analyze_tool(
 
 
 def check_vision_requirements() -> bool:
-    """Check if the configured runtime vision path can resolve a client."""
+    """Check if MiniMax MCP server is connected and available for vision analysis."""
     try:
-        from agent.auxiliary_client import resolve_vision_provider_client
-
-        _provider, client, _model = resolve_vision_provider_client()
-        return client is not None
+        from tools.mcp_tool import _servers, _lock
+        with _lock:
+            server = _servers.get("minimax")
+        return server is not None and server.session is not None
     except Exception:
         return False
 
