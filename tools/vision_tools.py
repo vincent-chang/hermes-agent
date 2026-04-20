@@ -728,19 +728,6 @@ async def vision_analyze_tool(
         # Extract the analysis — fall back to reasoning if content is empty
         analysis = extract_content_or_reasoning(response)
 
-        logger.info("Processing image with MiniMax vision API...")
-
-        # Call MiniMax understand_image API directly
-        try:
-            analysis = await _call_minimax_understand_image(
-                image_path=temp_image_path,
-                prompt=comprehensive_prompt,
-                mime_type=detected_mime_type,
-            )
-        except Exception as _api_err:
-            logger.error("MiniMax vision API failed: %s", str(_api_err)[:200])
-            raise
-
         analysis_length = len(analysis)
         
         logger.info("Image analysis completed (%s characters)", analysis_length)
