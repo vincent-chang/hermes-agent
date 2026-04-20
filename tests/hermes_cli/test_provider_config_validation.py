@@ -133,7 +133,7 @@ class TestNormalizeCustomProviderEntry:
         entry = {
             "base_url": "https://api.example.com/v1",
         }
-        result = _normalize_custom_provider_entry(entry, provider_key="")
+        result = _normalize_custom_provider_entry(entry)
         assert result is None
 
     def test_models_list_converted_to_dict(self):
