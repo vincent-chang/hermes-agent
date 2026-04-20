@@ -76,6 +76,7 @@ from tools.terminal_tool import cleanup_vm, get_active_env, is_persistent_env
 from tools.tool_result_storage import maybe_persist_tool_result, enforce_turn_budget
 from tools.interrupt import set_interrupt as _set_interrupt
 from tools.browser_tool import cleanup_browser
+from tools.registry import registry
 
 
 # Agent internals extracted to agent/ package for modularity
@@ -7871,24 +7872,172 @@ class AIAgent:
         )
         return compressed, new_system_prompt
 
+    def _is_mcp_tool(self, tool_name: str) -> bool:
+        """Return True if tool_name belongs to an MCP server (mcp-* toolset)."""
+        try:
+            toolset = registry.get_toolset_for_tool(tool_name)
+            return toolset is not None and toolset.startswith("mcp-")
+        except Exception:
+            return False
+
+    def _should_delegate_mcp_batch(self, tool_calls) -> tuple[bool, list, list]:
+        """Check if a batch of tool calls should be delegated to a subagent.
+
+        Returns (should_delegate, mcp_calls, non_mcp_calls).
+        MCP calls are delegated when there are 3 or more MCP tools in the batch.
+        Non-MCP tools are always executed directly.
+        """
+        mcp_calls = []
+        non_mcp_calls = []
+        for tc in tool_calls:
+            if self._is_mcp_tool(tc.function.name):
+                mcp_calls.append(tc)
+            else:
+                non_mcp_calls.append(tc)
+
+        # Delegate if 3+ MCP calls, but only if there are also non-MCP calls
+        # (pure MCP batches can proceed normally through concurrent execution)
+        should_delegate = len(mcp_calls) >= 3 and len(non_mcp_calls) > 0
+        return should_delegate, mcp_calls, non_mcp_calls
+
+    def _delegate_mcp_calls(self, mcp_calls: list, messages: list,
+                            effective_task_id: str) -> None:
+        """Delegate MCP tool calls to a subagent and append results to messages."""
+        # Build a goal describing each MCP call
+        goals = []
+        for tc in mcp_calls:
+            try:
+                args = json.loads(tc.function.arguments) if isinstance(tc.function.arguments, str) else tc.function.arguments
+            except (json.JSONDecodeError, TypeError):
+                args = {}
+            goals.append({
+                "tool_name": tc.function.name,
+                "arguments": args,
+            })
+
+        import time
+        goal_id = f"mcp_delegation_{int(time.time() * 1000)}"
+
+        # Import delegate_task here to avoid circular imports
+        from tools.delegate_tool import delegate_task as _delegate_task
+        from tools.delegate_tool import _get_max_concurrent_children
+
+        # Build a compact goal for the subagent
+        tool_summaries = []
+        for g in goals:
+            args_str = json.dumps(g["arguments"], ensure_ascii=False)[:200]
+            tool_summaries.append(f"  - {g['tool_name']}({args_str})")
+        goal_text = (
+            f"Execute the following MCP tool calls and return results:\n"
+            + "\n".join(tool_summaries)
+        )
+
+        context_text = (
+            f"Task ID: {effective_task_id or 'default'}\n"
+            f"Execute each tool call exactly as specified. Return the raw result of each call."
+        )
+
+        # Determine which toolsets to give the subagent for MCP access
+        # Collect all MCP server toolsets from the calls
+        mcp_toolsets = set()
+        for tc in mcp_calls:
+            try:
+                toolset = registry.get_toolset_for_tool(tc.function.name)
+                if toolset:
+                    mcp_toolsets.add(toolset)
+            except Exception:
+                pass
+
+        # Always include 'web' toolset as it may provide additional MCP access
+        all_toolsets = sorted(list(mcp_toolsets) + ["web"])
+
+        # Use delegate_task with single task mode
+        raw_result = None
+        try:
+            raw_result = _delegate_task(
+                goals=[{
+                    "goal": goal_text,
+                    "context": context_text,
+                    "toolsets": all_toolsets,
+                }],
+                tasks=None,  # single task mode
+                max_iterations=50,
+            )
+        except Exception as e:
+            raw_result = str(e)
+
+        # Parse JSON string result from delegate_tool (it returns json.dumps(...))
+        try:
+            result = json.loads(raw_result) if isinstance(raw_result, str) else raw_result
+        except (json.JSONDecodeError, TypeError):
+            result = raw_result
+
+        # Parse results and create tool response messages
+        if isinstance(result, dict) and "results" in result:
+            for i, tc in enumerate(mcp_calls):
+                task_result = result["results"][i] if i < len(result["results"]) else {"result": str(result)}
+                raw_result_text = task_result.get("result", "") if isinstance(task_result, dict) else str(task_result)
+                # Include error field if present
+                if isinstance(task_result, dict) and task_result.get("error"):
+                    raw_result_text = f"{raw_result_text}\n[Error: {task_result['error']}]".strip()
+                messages.append({
+                    "role": "tool",
+                    "content": raw_result_text,
+                    "tool_call_id": tc.id,
+                })
+        else:
+            # Fallback: attach raw result to each call
+            for tc in mcp_calls:
+                messages.append({
+                    "role": "tool",
+                    "content": str(result) if result else "[No result]",
+                    "tool_call_id": tc.id,
+                })
+
     def _execute_tool_calls(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
         """Execute tool calls from the assistant message and append results to messages.
 
         Dispatches to concurrent execution only for batches that look
         independent: read-only tools may always share the parallel path, while
         file reads/writes may do so only when their target paths do not overlap.
+
+        MCP tool call handling: batches with 3+ MCP tools AND at least one
+        non-MCP tool are automatically delegated to a subagent to keep the
+        parent agent's context clean.
         """
         tool_calls = assistant_message.tool_calls
 
         # Allow _vprint during tool execution even with stream consumers
         self._executing_tools = True
         try:
-            if not _should_parallelize_tool_batch(tool_calls):
-                return self._execute_tool_calls_sequential(
-                    assistant_message, messages, effective_task_id, api_call_count
-                )
+            # Check if we should auto-delegate MCP calls to a subagent
+            should_delegate, mcp_calls, non_mcp_calls = self._should_delegate_mcp_batch(tool_calls)
 
-            return self._execute_tool_calls_concurrent(
+            if should_delegate and mcp_calls:
+                if not self.quiet_mode:
+                    print(f"  ⚡ Auto-delegating {len(mcp_calls)} MCP tool call(s) to subagent "
+                          f"(non-MCP: {', '.join(tc.function.name for tc in non_mcp_calls)})")
+
+                # Build a modified assistant_message with only non-MCP calls
+                # Execute those first, then delegate MCP calls
+                class _NonMCPMessage:
+                    def __init__(inner, original_calls):
+                        inner.tool_calls = original_calls
+
+                if non_mcp_calls:
+                    # Execute non-MCP calls first
+                    self._execute_tool_calls_impl(
+                        _NonMCPMessage(non_mcp_calls), messages, effective_task_id, api_call_count
+                    )
+
+                # Delegate MCP calls to subagent
+                self._delegate_mcp_calls(mcp_calls, messages, effective_task_id)
+                return
+
+            # Normal execution path
+            if not tool_calls:
+                return  # nothing to execute
+            return self._execute_tool_calls_impl(
                 assistant_message, messages, effective_task_id, api_call_count
             )
         finally:
@@ -7911,6 +8060,19 @@ class AIAgent:
             acp_args=function_args.get("acp_args"),
             role=function_args.get("role"),
             parent_agent=self,
+        )
+
+    def _execute_tool_calls_impl(self, assistant_message, messages: list,
+                                  effective_task_id: str, api_call_count: int = 0) -> None:
+        """Internal tool call executor (split from main method for delegation)."""
+        tool_calls = assistant_message.tool_calls
+        if not _should_parallelize_tool_batch(tool_calls):
+            return self._execute_tool_calls_sequential(
+                assistant_message, messages, effective_task_id, api_call_count
+            )
+
+        return self._execute_tool_calls_concurrent(
+            assistant_message, messages, effective_task_id, api_call_count
         )
 
     def _invoke_tool(self, function_name: str, function_args: dict, effective_task_id: str,
