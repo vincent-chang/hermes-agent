@@ -766,10 +766,29 @@ async def vision_analyze_tool(
             "content_policy", "multimodal",
             "unrecognized request argument", "image input",
         )):
-            analysis = (
-                "MiniMax vision MCP does not support this request or it was not "
-                f"accepted by the server. Error: {e}"
+            # Fallback: try MiniMax direct API (does not require multimodal LLM)
+            logger.warning(
+                "Vision via async_call_llm failed (%s). "
+                "Retrying with MiniMax direct API as fallback...", e
             )
+            try:
+                analysis = await _call_minimax_understand_image(
+                    temp_image_path, comprehensive_prompt, mime_type=detected_mime_type
+                )
+                result = {
+                    "success": True,
+                    "analysis": analysis,
+                    "_fallback": True,  # mark so caller knows fallback was used
+                }
+                _debug.log_call("vision_analyze_tool", debug_call_data)
+                _debug.save()
+                return json.dumps(result, indent=2, ensure_ascii=False)
+            except Exception as fallback_err:
+                logger.error("MiniMax direct API fallback also failed: %s", fallback_err)
+                analysis = (
+                    "Neither the main vision provider nor MiniMax direct API "
+                    f"could analyze this image. Error: {fallback_err}"
+                )
         elif "invalid_request" in err_str or "image_url" in err_str:
             analysis = (
                 "The vision API rejected the image. This can happen when the "
