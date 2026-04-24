@@ -112,6 +112,14 @@ try:
     from lark_oapi.event.dispatcher_handler import EventDispatcherHandler
     from lark_oapi.ws import Client as FeishuWSClient
 
+    # cardkit for streaming update cards
+    from lark_oapi.api.cardkit.v1.model.create_card_request import CreateCardRequest
+    from lark_oapi.api.cardkit.v1.model.create_card_request_body import CreateCardRequestBody
+    from lark_oapi.api.cardkit.v1.model.content_card_element_request import ContentCardElementRequest
+    from lark_oapi.api.cardkit.v1.model.content_card_element_request_body import ContentCardElementRequestBody
+    from lark_oapi.api.cardkit.v1.model.settings_card_request import SettingsCardRequest
+    from lark_oapi.api.cardkit.v1.model.settings_card_request_body import SettingsCardRequestBody
+
     FEISHU_AVAILABLE = True
 except ImportError:
     FEISHU_AVAILABLE = False
@@ -170,6 +178,7 @@ _FEISHU_IMAGE_UPLOAD_TYPE = "message"
 _FEISHU_FILE_UPLOAD_TYPE = "stream"
 _FEISHU_OPUS_UPLOAD_EXTENSIONS = {".ogg", ".opus"}
 _FEISHU_MEDIA_UPLOAD_EXTENSIONS = {".mp4", ".mov", ".avi", ".m4v"}
+_FEISHU_AUDIO_UPLOAD_EXTENSIONS = {".mp3", ".m4a", ".wav", ".mp4a", ".aac", ".flac"}
 _FEISHU_DOC_UPLOAD_TYPES = {
     ".pdf": "pdf",
     ".doc": "doc",
@@ -1792,6 +1801,159 @@ class FeishuAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.warning("[Feishu] send_exec_approval failed: %s", exc)
             return SendResult(success=False, error=str(exc))
+
+    async def send_streaming_card(
+        self,
+        chat_id: str,
+        *,
+        header_title: str,
+        header_template: str = "blue",
+        initial_content: str = "",
+        element_id: str = "progress_text",
+        summary: str = "...",
+        print_frequency_ms: int = 50,
+        print_step: int = 2,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> tuple[Optional[str], Optional[str], Optional[str]]:
+        """Send a streaming-update card and return (card_id, message_id, error).
+
+        The card is created with streaming_mode=true (JSON 2.0 schema) and sent
+        to ``chat_id``. After this call, caller repeatedly calls
+        ``update_streaming_text`` to push content with typewriter effect.
+
+        Returns (card_id, message_id, error_string).
+        """
+        if not self._client:
+            return None, None, "Not connected"
+
+        try:
+            # Build the streaming card JSON
+            card_json = {
+                "schema": "2.0",
+                "header": {
+                    "title": {"tag": "plain_text", "content": header_title},
+                    "template": header_template,
+                },
+                "config": {
+                    "streaming_mode": True,
+                    "summary": {"content": summary},
+                    "streaming_config": {
+                        "print_frequency_ms": {"default": print_frequency_ms},
+                        "print_step": {"default": print_step},
+                        "print_strategy": "fast",
+                    },
+                },
+                "body": {
+                    "elements": [
+                        {
+                            "tag": "markdown",
+                            "content": initial_content,
+                            "element_id": element_id,
+                        }
+                    ]
+                },
+            }
+
+            card_data_str = json.dumps(card_json, ensure_ascii=False)
+
+            # Step 1: Create card entity
+            body = CreateCardRequestBody.builder().type("card_json").data(card_data_str).build()
+            request = CreateCardRequest.builder().request_body(body).build()
+
+            create_resp = await asyncio.to_thread(self._client.cardkit.v1.card.create, request)
+            if not hasattr(create_resp, "data") or not create_resp.data:
+                return None, None, f"card create failed: {getattr(create_resp, 'msg', str(create_resp))}"
+
+            card_id: str = create_resp.data.card.card_id
+
+            # Step 2: Send card entity to chat
+            msg_content = json.dumps({"type": "card", "data": {"card_id": card_id}}, ensure_ascii=False)
+            response = await self._feishu_send_with_retry(
+                chat_id=chat_id,
+                msg_type="interactive",
+                payload=msg_content,
+                reply_to=None,
+                metadata=metadata,
+            )
+            result = self._finalize_send_result(response, "streaming card send failed")
+            message_id = result.message_id if result.success else None
+
+            if not result.success:
+                return card_id, None, result.error
+
+            return card_id, message_id, None
+
+        except Exception as exc:
+            logger.error("[Feishu] send_streaming_card failed: %s", exc, exc_info=True)
+            return None, None, str(exc)
+
+    async def update_streaming_text(
+        self,
+        card_id: str,
+        element_id: str,
+        content: str,
+        *,
+        uuid: Optional[str] = None,
+    ) -> Optional[str]:
+        """Push text content to a streaming card element (typewriter effect).
+
+        ``uuid`` should be an incrementing sequence identifier (string) to
+        ensure ordered delivery. Returns error string or None on success.
+        """
+        if not self._client:
+            return "Not connected"
+
+        try:
+            req_body = ContentCardElementRequestBody.builder().content(content)
+            if uuid is not None:
+                req_body = req_body.uuid(uuid)
+            request = (
+                ContentCardElementRequest.builder()
+                .card_id(card_id)
+                .element_id(element_id)
+                .request_body(req_body.build())
+                .build()
+            )
+            resp = await asyncio.to_thread(self._client.cardkit.v1.card_element.content.update, request)
+            if getattr(resp, "code", 0) != 0:
+                return f"update_streaming_text failed: {getattr(resp, 'msg', str(resp))}"
+            return None
+        except Exception as exc:
+            logger.error("[Feishu] update_streaming_text failed: %s", exc, exc_info=True)
+            return str(exc)
+
+    async def disable_streaming_mode(
+        self,
+        card_id: str,
+        final_summary: Optional[str] = None,
+    ) -> Optional[str]:
+        """Disable streaming mode on a card after all updates are done.
+
+        Optionally set ``final_summary`` to replace the default summary text.
+        """
+        if not self._client:
+            return "Not connected"
+
+        try:
+            settings_json = {"config": {"streaming_mode": False}}
+            if final_summary:
+                settings_json["config"]["summary"] = {"content": final_summary}
+            settings_str = json.dumps(settings_json, ensure_ascii=False)
+
+            body = SettingsCardRequestBody.builder().settings(settings_str)
+            request = (
+                SettingsCardRequest.builder()
+                .card_id(card_id)
+                .request_body(body.build())
+                .build()
+            )
+            resp = await asyncio.to_thread(self._client.cardkit.v1.card.settings, request)
+            if getattr(resp, "code", 0) != 0:
+                return f"disable_streaming_mode failed: {getattr(resp, 'msg', str(resp))}"
+            return None
+        except Exception as exc:
+            logger.error("[Feishu] disable_streaming_mode failed: %s", exc, exc_info=True)
+            return str(exc)
 
     @staticmethod
     def _build_resolved_approval_card(*, choice: str, user_name: str) -> Dict[str, Any]:
@@ -3855,6 +4017,18 @@ class FeishuAdapter(BasePlatformAdapter):
             file_path=display_name,
             requested_message_type=outbound_message_type,
         )
+
+        # Audio files must use the dedicated /im/v1/audio/create endpoint.
+        if resolved_message_type == "audio":
+            return await self._send_audio_message(
+                chat_id=chat_id,
+                file_path=file_path,
+                file_name=display_name,
+                caption=caption,
+                reply_to=reply_to,
+                metadata=metadata,
+            )
+
         try:
             with open(file_path, "rb") as file_obj:
                 body = self._build_file_upload_body(
@@ -3896,6 +4070,131 @@ class FeishuAdapter(BasePlatformAdapter):
             return self._finalize_send_result(message_response, "file send failed")
         except Exception as exc:
             logger.error("[Feishu] Failed to send file %s: %s", file_path, exc, exc_info=True)
+            return SendResult(success=False, error=str(exc))
+
+    async def _send_audio_message(
+        self,
+        *,
+        chat_id: str,
+        file_path: str,
+        file_name: str,
+        caption: Optional[str],
+        reply_to: Optional[str],
+        metadata: Optional[Dict[str, Any]],
+    ) -> SendResult:
+        """Send an audio file as an inline audio message (voice bubble) in Feishu.
+
+        Feishu requires: (1) upload to /im/v1/files with file_type=opus + duration_ms,
+        then (2) send to /im/v1/messages with msg_type=audio + the returned file_key.
+        ffmpeg is used to transcode any format (mp3/m4a/wav/...) to opus before upload.
+        """
+        try:
+            import io as _io
+            import httpx
+            import subprocess
+
+            # Get audio duration and transcode to opus via ffmpeg (in-memory).
+            duration_ms = "1000"
+            try:
+                probe = subprocess.run(
+                    [
+                        "ffprobe", "-v", "quiet", "-print_format", "json",
+                        "-show_format", "-show_streams", file_path,
+                    ],
+                    capture_output=True, text=True, timeout=15,
+                )
+                if probe.returncode == 0:
+                    import json as _json
+                    probe_data = _json.loads(probe.stdout)
+                    duration_str = (
+                        probe_data.get("format", {}).get("duration")
+                        or probe_data.get("streams", [{}])[0].get("duration", "")
+                    )
+                    if duration_str:
+                        duration_ms = str(int(float(duration_str) * 1000))
+            except Exception:
+                pass  # Use default 1000ms
+
+            try:
+                opus_data = subprocess.run(
+                    [
+                        "ffmpeg", "-y", "-i", file_path,
+                        "-c:a", "libopus", "-b:a", "128k",
+                        "-f", "opus", "-",
+                    ],
+                    capture_output=True, timeout=60,
+                )
+                if opus_data.returncode != 0:
+                    return SendResult(
+                        success=False,
+                        error=f"ffmpeg transcode failed: {opus_data.stderr.decode('utf-8', errors='replace')}",
+                    )
+                opus_bytes = opus_data.stdout
+            except subprocess.TimeoutExpired:
+                return SendResult(success=False, error="ffmpeg transcoding timed out")
+
+            # Get a fresh access token (same pattern as onboarding code).
+            token_data = json.dumps(
+                {"app_id": self._app_id, "app_secret": self._app_secret}
+            ).encode("utf-8")
+            token_req = Request(
+                "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+                data=token_data,
+                headers={"Content-Type": "application/json"},
+            )
+            with urlopen(token_req, timeout=10) as resp:
+                token_res = json.loads(resp.read().decode("utf-8"))
+            token = token_res.get("tenant_access_token")
+            if not token:
+                return SendResult(success=False, error=f"Failed to obtain Feishu access token: {token_res}")
+
+            # Upload opus file to /im/v1/files with file_type=opus + duration_ms.
+            upload_url = "https://open.feishu.cn/open-apis/im/v1/files"
+            opus_name = file_name.rsplit(".", 1)[0] + ".opus"
+            form_data = {
+                "file_type": (None, "opus"),
+                "file_name": (None, opus_name),
+                "duration": (None, duration_ms),
+                "file": (opus_name, _io.BytesIO(opus_bytes), "audio/opus"),
+            }
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                upload_resp = await client.post(
+                    upload_url,
+                    files=form_data,
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+            if upload_resp.status_code != 200:
+                try:
+                    err_body = upload_resp.json()
+                    err_msg = err_body.get("msg", upload_resp.text)
+                except Exception:
+                    err_msg = upload_resp.text
+                return SendResult(
+                    success=False,
+                    error=f"Audio upload failed [{upload_resp.status_code}]: {err_msg}",
+                    raw_response=upload_resp.text,
+                )
+
+            upload_data = upload_resp.json()
+            file_key = upload_data.get("data", {}).get("file_key")
+            if not file_key:
+                return SendResult(
+                    success=False,
+                    error=f"Feishu audio upload missing file_key: {upload_data}",
+                    raw_response=upload_data,
+                )
+
+            # Send audio message with the file_key.
+            message_response = await self._feishu_send_with_retry(
+                chat_id=chat_id,
+                msg_type="audio",
+                payload=json.dumps({"file_key": file_key}, ensure_ascii=False),
+                reply_to=reply_to,
+                metadata=metadata,
+            )
+            return self._finalize_send_result(message_response, "audio send failed")
+        except Exception as exc:
+            logger.error("[Feishu] Failed to send audio %s: %s", file_path, exc, exc_info=True)
             return SendResult(success=False, error=str(exc))
 
     async def _send_raw_message(
@@ -4283,6 +4582,11 @@ class FeishuAdapter(BasePlatformAdapter):
 
         if ext in _FEISHU_OPUS_UPLOAD_EXTENSIONS:
             return "opus", "audio"
+
+        if ext in _FEISHU_AUDIO_UPLOAD_EXTENSIONS:
+            # No lark_oapi support for /im/v1/audio, no ffmpeg for conversion.
+            # Send as stream file (downloadable attachment, not inline audio).
+            return _FEISHU_FILE_UPLOAD_TYPE, "file"
 
         if ext in _FEISHU_MEDIA_UPLOAD_EXTENSIONS:
             return "mp4", "media"
