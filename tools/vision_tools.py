@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Dict, Optional
 from urllib.parse import urlparse
 import httpx
+from agent.auxiliary_client import async_call_llm, extract_content_or_reasoning
 from tools.debug_helpers import DebugSession
 from tools.website_policy import check_website_access
 
@@ -230,6 +231,16 @@ def _resolve_download_timeout() -> float:
     return 30.0
 
 _VISION_DOWNLOAD_TIMEOUT = _resolve_download_timeout()
+
+
+def _is_image_size_error(error: Exception) -> bool:
+    """Detect if an API error is related to image or payload size."""
+    err_str = str(error).lower()
+    return any(hint in err_str for hint in (
+        "too large", "payload", "413", "content_too_large",
+        "request_too_large", "image_url", "invalid_request",
+        "exceeds", "size limit",
+    ))
 
 # Hard cap on downloaded image file size (50 MB). Prevents OOM from
 # attacker-hosted multi-gigabyte files or decompression bombs.
@@ -659,6 +670,9 @@ async def vision_analyze_tool(
         # Use the prompt as provided (model_tools.py now handles full description formatting)
         comprehensive_prompt = user_prompt
 
+        # Encode image to base64 data URL before building messages
+        image_data_url = _image_to_base64_data_url(temp_image_path, mime_type=detected_mime_type)
+
         # Prepare the message with base64-encoded image
         messages = [
             {
@@ -765,6 +779,7 @@ async def vision_analyze_tool(
             "does not support", "not support image",
             "content_policy", "multimodal",
             "unrecognized request argument", "image input",
+            "no llm provider configured", "provider=auto",
         )):
             # Fallback: try MiniMax direct API (does not require multimodal LLM)
             logger.warning(
